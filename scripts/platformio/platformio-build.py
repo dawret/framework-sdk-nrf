@@ -234,22 +234,25 @@ def correct_escape_sequences(file_path):
     with open(file_path, 'w') as file:
         file.write(corrected_content)
 
-
-if env.Execute("$PYTHONEXE -m pip  -q install --break-system-packages west==1.5.0"):
-    env.Exit(1)
-
-if machine() == 'x86_64':
+def install_python_package(package_name, package_source=None, version_spec=None):
+    if not package_source:
+        package_source = package_name
     try:
-        import pyocd
+        __import__(package_name)
     except ModuleNotFoundError:
-        if env.Execute("$PYTHONEXE -m pip -q install --break-system-packages git+https://github.com/tomaszduda23/pyOCD@949193f7cbf09081f8e46d6b9d2e4a79e536997e"):
+        if shutil.which("uv"):
+            pip_cmd = "uv pip"
+        else:
+            pip_cmd = f"$PYTHONEXE -m pip"
+        if env.Execute(f"{pip_cmd} -q install --break-system-packages {package_source}{version_spec}"):
             env.Exit(1)
 
-try:
-    import cbor2
-except ModuleNotFoundError:
-    if env.Execute("$PYTHONEXE -m pip -q install --break-system-packages cbor2==5.6.5"):
-        env.Exit(1)
+install_python_package("west", version_spec="==1.5.0")
+install_python_package("cbor2", version_spec="==5.6.5")
+
+
+if machine() == 'x86_64':
+    install_python_package("pyocd", package_source="git+https://github.com/tomaszduda23/pyOCD", version_spec="@949193f7cbf09081f8e46d6b9d2e4a79e536997e")
 
 framework_zephyr_version = version.get_original_version(FRAMEWORK_VERSION)
 
