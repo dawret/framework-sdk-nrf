@@ -96,6 +96,7 @@ def run_cmake():
     )
 
     python_executable = env.get("PYTHONEXE")
+    semver = semantic_version.Version(framework_zephyr_version)
     cmake_cmd = [
         os.path.join(platform.get_package_dir("tool-cmake") or "", "bin", "cmake"),
         "-S",
@@ -104,6 +105,12 @@ def run_cmake():
         BUILD_DIR,
         "-GNinja",
         "-DBOARD=%s" % get_zephyr_target(board),
+        "-DCMAKE_DISABLE_FIND_PACKAGE_ZephyrBuildConfiguration=TRUE",
+        "-DCMAKE_DISABLE_FIND_PACKAGE_ZephyrAppConfiguration=TRUE",
+        f"-DNCS_VERSION_MAJOR={semver.major}",
+        f"-DNCS_VERSION_MINOR={semver.major}",
+        f"-DNCS_VERSION_PATCH={semver.major}",
+        f"-DNCS_VERSION_EXTRA={semver.major}",
         "-DPYTHON_EXECUTABLE:FILEPATH=%s" % python_executable,
         "-DPython3_EXECUTABLE:FILEPATH=%s" % python_executable,
         "-DPIO_PACKAGES_DIR:PATH=%s" % env.subst("$PROJECT_PACKAGES_DIR"),
