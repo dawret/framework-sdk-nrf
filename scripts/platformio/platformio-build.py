@@ -13,13 +13,14 @@
 # limitations under the License.
 
 import os
-import subprocess
 import sys
 import shutil
 import json
 import semantic_version
 import filecmp
 from platform import machine
+from pathlib import Path
+import yaml
 
 from platformio.package import version
 from platformio.compat import IS_WINDOWS
@@ -254,12 +255,42 @@ def install_python_package(package_name, package_source=None, version_spec=None)
         if env.Execute(f"{pip_cmd} -q install --break-system-packages {package_source}{version_spec}"):
             env.Exit(1)
 
-install_python_package("west", version_spec="==1.5.0")
-install_python_package("cbor2", version_spec="==5.6.5")
+def install_deps():
+    install_python_package("west", version_spec="==1.5.0")
+    install_python_package("cbor2", version_spec="==5.6.5")
+    if machine() == 'x86_64':
+        install_python_package("pyocd", package_source="git+https://github.com/tomaszduda23/pyOCD", version_spec="@949193f7cbf09081f8e46d6b9d2e4a79e536997e")
 
+def install_toolchain():
+    toolchain_install_script = os.path.join(platform.get_package_dir("toolchain-gccarmnoneeabi"), "install.py")
+    if os.path.isfile(toolchain_install_script):
+        if env.Execute(f"$PYTHONEXE {toolchain_install_script}"):
+            env.Exit(1)
 
-if machine() == 'x86_64':
-    install_python_package("pyocd", package_source="git+https://github.com/tomaszduda23/pyOCD", version_spec="@949193f7cbf09081f8e46d6b9d2e4a79e536997e")
+def generate_west_yml(version, out_path: Path):
+    content = {
+        "manifest": {
+            "remotes": [{"name": "zephyrproject-rtos", "url-base": "https://github.com/zephyrproject-rtos"}],
+            "projects": [
+                {
+                    "name": "zephyr",
+                    "revision": f"v{version}",
+                    "remote": "zephyrproject-rtos",
+                    "import": {
+                        "name-allowlist": ["cmsis", "hal_nordic"],
+                    }
+                }
+            ],
+        }
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as fp:
+        yaml.dump(content, fp)
+
+def install_zephyr(path: Path, version: str):
+    python_executable = env.get("PYTHONEXE")
+    if not (path / ".west").exists():
+        exec_command([python_executable, "-m", "west", "init", "-l", ])
 
 framework_zephyr_version = version.get_original_version(FRAMEWORK_VERSION)
 
@@ -285,10 +316,7 @@ if not os.path.isfile(WEST_UPDATED):
 
     open(WEST_UPDATED, "x")
 
-toolchain_install_script = os.path.join(platform.get_package_dir("toolchain-gccarmnoneeabi"), "install.py")
-if os.path.isfile(toolchain_install_script):
-    if env.Execute(f"$PYTHONEXE {toolchain_install_script}"):
-        env.Exit(1)
+
 
 os.makedirs(LOCAL_BIN, exist_ok=True)
 #need git in path
