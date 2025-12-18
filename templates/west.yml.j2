@@ -1,0 +1,14 @@
+manifest:
+  projects:
+  - clone-depth: 1
+    import:
+      name-allowlist:
+      {% for module in modules %}
+      - {{ module }}
+      {% endfor %}
+    name: zephyr
+    remote: zephyrproject-rtos
+    revision: {{ version }}
+  remotes:
+  - name: zephyrproject-rtos
+    url-base: https://github.com/zephyrproject-rtos

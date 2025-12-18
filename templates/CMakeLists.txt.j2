@@ -1,0 +1,12 @@
+cmake_minimum_required(VERSION 3.20.0)
+
+find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+
+project({{ project_name }})
+
+SET(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} {{ build_flags | join(" ") }}")
+SET(CMAKE_C_FLAGS  "${CMAKE_C_FLAGS} {{ build_flags | join(" ") }}")
+zephyr_ld_options({{ link_flags }})
+
+target_sources(app PRIVATE {{ source_files | join(" ") }})
+target_include_directories(app PRIVATE ../src)
