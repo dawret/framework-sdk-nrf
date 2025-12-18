@@ -163,6 +163,12 @@ class ZephyrSdk:
         if cmake_txt_path.stat().st_mtime > cmake_cache_path.stat().st_mtime:
             # Reconfigure after CMakeLists.txt changes
             return True
+        build_ninja_path = self.build_env.build_dir / "build.ninja"
+        if not build_ninja_path.exists():
+            return True
+        if cmake_cache_path.stat().st_mtime > build_ninja_path.stat().st_mtime:
+            # Reconfigure after CMakeCache.txt changes
+            return True
         return False
 
     def _generate_west_config(self):
