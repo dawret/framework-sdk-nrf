@@ -15,12 +15,7 @@
 import os
 import sys
 import shutil
-import json
-import semantic_version
-import filecmp
-from platform import machine
 from pathlib import Path
-import yaml
 import jinja2
 
 from platformio.package import version
@@ -36,27 +31,6 @@ board = env.BoardConfig()
 
 ZEPHYR_ENV_VERSION = "1.0.0"
 FRAMEWORK_VERSION = platform.get_package_version("framework-zephyr").split("+")[0]
-TOOLCHAIN_VERSION = version.get_original_version(
-    platform.get_package_version("toolchain-gccarmnoneeabi").split("+")[0]
-)
-TOOLCHAIN_ROOT = os.path.join(
-    platform.get_package_dir("toolchain-gccarmnoneeabi"),
-    "zephyr-sdk-0.%s" % TOOLCHAIN_VERSION,
-)
-
-PROJECT_DIR = env.subst("$PROJECT_DIR")
-PROJECT_SRC_DIR = env.subst("$PROJECT_SRC_DIR")
-BUILD_DIR = env.subst("$BUILD_DIR")
-BUILD_FLAGS = env.get("BUILD_FLAGS")
-BUILD_TYPE = env.subst("$BUILD_TYPE")
-CMAKE_API_DIR = os.path.join(BUILD_DIR, ".cmake", "api", "v1")
-CMAKE_API_QUERY_DIR = os.path.join(CMAKE_API_DIR, "query")
-CMAKE_API_REPLY_DIR = os.path.join(CMAKE_API_DIR, "reply")
-
-FRAMEWORK_DIR = platform.get_package_dir("framework-zephyr")
-assert os.path.isdir(FRAMEWORK_DIR)
-
-LOCAL_BIN = os.path.join(FRAMEWORK_DIR, "bin")
 
 
 def check_command(ret, msg):
@@ -70,7 +44,9 @@ class BuildEnvironment:
         self, project_dir: Path, source_dir: Path, build_dir: Path, framework_dir: Path
     ):
         self.venv_path = None
-        self.env = {}
+        self.env = {
+            "PATH": os.confstr("CS_PATH") if hasattr(os, "confstr") else "/usr/bin:/bin"
+        }
         self.project_dir = project_dir
         self.source_dir = source_dir
         self.build_dir = build_dir
@@ -79,26 +55,29 @@ class BuildEnvironment:
     def _python(self):
         if not self.venv_path:
             raise RuntimeError("Virtual environment is not created yet")
-        if os.name == "nt":
+        if IS_WINDOWS:
             return self.venv_path / "Scripts" / "python.exe"
         return self.venv_path / "bin" / "python"
 
     def create_venv(self, path: Path):
         if path.exists():
+            self.venv_path = path
+            self.set_env("PATH", str(self._python().parent))
             return
 
         ret = exec_command([sys.executable, "-m", "venv", path])
         check_command(ret, f"Failed to create virtual environment at {path}")
         self.venv_path = path
+        self.set_env("PATH", str(self._python().parent))
 
     def install_requirements(self, requirements_file: Path):
         ret = exec_command(
-            [self._python(), "-m", "pip", "install", "-r", requirements_file]
+            [str(self._python()), "-m", "pip", "install", "-r", requirements_file]
         )
         check_command(ret, f"Failed to install dependencies from {requirements_file}")
 
     def run_python(self, args, cwd: Path | None = None):
-        cmd = [self._python()] + args
+        cmd = [str(self._python())] + args
         ret = exec_command(cmd, cwd=cwd, env=self.env)
         out, err = check_command(ret, f"Failed to run command: {' '.join(cmd)}")
         return (out, err)
@@ -161,6 +140,7 @@ class ZephyrSdk:
         if (not cmake_txt_path.exists()) or (
             cmake_txt_path.read_text() != cmake_txt_tpl
         ):
+            print("Generating CMakeLists.txt")
             cmake_txt_path.write_text(cmake_txt_tpl)
             self.need_reconfigure = True
 
@@ -178,6 +158,8 @@ class ZephyrSdk:
             return True
         cmake_txt_path = self.app_dir / "CMakeLists.txt"
         cmake_cache_path = self.build_env.build_dir / "CMakeCache.txt"
+        if not cmake_cache_path.exists():
+            return True
         if cmake_txt_path.stat().st_mtime > cmake_cache_path.stat().st_mtime:
             # Reconfigure after CMakeLists.txt changes
             return True
@@ -191,6 +173,7 @@ class ZephyrSdk:
         west_yml_tpl = self.jinja_env.get_template("west.yml.j2").render(context)
         west_yml_path = self.app_dir / "west.yml"
         if (not west_yml_path.exists()) or (west_yml_path.read_text() != west_yml_tpl):
+            print("Generating west.yml")
             west_yml_path.write_text(west_yml_tpl)
             self.need_reconfigure = True
 
@@ -198,25 +181,59 @@ class ZephyrSdk:
         # self._generate_project_files(build_flags, link_flags, source_files)
         self._generate_west_config()
         if not (self.build_env.project_dir / ".west").exists():
+            print("Running west init...")
             self.build_env.run_python(
                 [
                     "-m",
                     "west",
                     "init",
                     "-l",
-                    self.app_dir.relative_to(self.workspace_dir),
+                    str(self.app_dir.relative_to(self.workspace_dir)),
                 ],
                 cwd=self.workspace_dir,
             )
-        self.build_env.run_python(
-            ["-m", "west", "update", "--narrow", "--fetch-opt=--depth=1"],
-            cwd=self.workspace_dir,
-        )
-        self.build_env.run_python(
-            ["-m", "west", "packages", "pip", "--install"], cwd=self.workspace_dir
-        )
+        west_update_marker = self.workspace_dir / ".west_updated"
+        west_yml_path = self.app_dir / "west.yml"
+        if (
+            not west_update_marker.exists()
+            or west_yml_path.stat().st_mtime > west_update_marker.stat().st_mtime
+        ):
+            self.need_reconfigure = True
+        if self.need_reconfigure:
+            print("Running west update...")
+            self.build_env.run_python(
+                ["-m", "west", "update", "--narrow", "--fetch-opt=--depth=1"],
+                cwd=self.workspace_dir,
+            )
+            self.build_env.run_python(
+                ["-m", "west", "packages", "pip", "--install"], cwd=self.workspace_dir
+            )
+            west_update_marker.touch()
         self.build_env.load_env_from_script(self.zephyr_dir / "zephyr-env.sh")
-        self.build_env.set_env("ZEPHYR_BASE", str(self.zephyr_dir))
+
+    def _set_extra_cmake_args(self, cmake_extra_args):
+        try:
+            old_args, _ = self.build_env.run_python(
+                ["-m", "west", "config", "build.cmake-args"]
+            )
+            old_args = old_args.strip().split()
+            if sorted(old_args) == sorted(cmake_extra_args):
+                return
+        except Exception:
+            pass
+
+        print("Setting extra CMake args:", cmake_extra_args)
+        self.build_env.run_python(
+            [
+                "-m",
+                "west",
+                "config",
+                "build.cmake-args",
+                "--",
+                " ".join(cmake_extra_args),
+            ]
+        )
+        self.need_reconfigure = True
 
     def build(
         self,
@@ -232,25 +249,30 @@ class ZephyrSdk:
     ):
         self._generate_project_files(build_flags, link_flags, source_files)
         menuconfig_file = self.app_dir / "menuconfig.conf"
+        if menuconfig_file.is_file():
+            cmake_extra_args = [
+                f"-DOVERLAY_CONFIG:FILEPATH={menuconfig_file}"
+            ] + cmake_extra_args
+        cmake_extra_args = [
+            f"-DPIO_PACKAGES_DIR:PATH={package_dir}",
+            f"-DDOTCONFIG={config_path}",
+        ] + cmake_extra_args
+        self._set_extra_cmake_args(cmake_extra_args)
+
         west_cmd = [
+            "-m",
             "west",
             "build",
-            "--sysbuild" if sysbuild else "",
-            "-p" if self._is_reconfigure_required() else "",
+            "--sysbuild" if sysbuild else "--no-sysbuild",
+            "-p",
+            "always" if self._is_reconfigure_required() else "auto",
             "-b",
             board,
             "-d",
-            self.build_env.build_dir,
-            self.app_dir,
-            "--",
-            f"-DPIO_PACKAGES_DIR:PATH={package_dir}",
-            f"-DDOTCONFIG={config_path}",
-            (
-                f"-DOVERLAY_CONFIG:FILEPATH={menuconfig_file}"
-                if menuconfig_file.is_file()
-                else ""
-            ),
-        ] + cmake_extra_args
+            str(self.build_env.build_dir),
+            str(self.app_dir.relative_to(self.workspace_dir)),
+        ]
+        print("Building Zephyr project...")
         out, err = self.build_env.run_python(west_cmd, cwd=self.workspace_dir)
         if verbose:
             print(out)
@@ -265,7 +287,7 @@ class ZephyrSdk:
         if not app_hex.is_file():
             raise RuntimeError(f"Cannot find application hex file at {app_hex}")
         self.build_env.run_python(
-            [script_path, "-o", target, mcuboot_hex, app_hex],
+            [str(script_path), "-o", str(target), str(mcuboot_hex), str(app_hex)],
             cwd=self.build_env.build_dir,
         )
 
@@ -276,131 +298,8 @@ class ZephyrSdk:
         shutil.copy2(app_elf, target)
 
 
-def run_west_build():
-    print("Reading CMake configuration")
-
-    CONFIG_PATH = board.get(
-        "build.zephyr.config_path",
-        os.path.join(PROJECT_DIR, "config.%s" % env.subst("$PIOENV")),
-    )
-
-    python_executable = env.get("PYTHONEXE")
-    west_cmd = [
-        python_executable,
-        "-m",
-        "west",
-        "build",
-        "--sysbuild",
-        "-b",
-        get_zephyr_target(board),
-        "-d",
-        BUILD_DIR,
-        os.path.join(PROJECT_DIR, "app"),
-        "--",
-        "-DPIO_PACKAGES_DIR:PATH=%s" % env.subst("$PROJECT_PACKAGES_DIR"),
-        "-DDOTCONFIG=" + CONFIG_PATH,
-    ]
-
-    menuconfig_file = os.path.join(PROJECT_DIR, "app", "menuconfig.conf")
-    if os.path.isfile(menuconfig_file):
-        print("Adding -DOVERLAY_CONFIG:FILEPATH=%s" % menuconfig_file)
-        west_cmd.append("-DOVERLAY_CONFIG:FILEPATH=%s" % menuconfig_file)
-
-    if board.get("build.zephyr.cmake_extra_args", ""):
-        west_cmd.extend(
-            click.parser.split_arg_string(board.get("build.zephyr.cmake_extra_args"))
-        )
-
-    # Run Zephyr in an isolated environment with specific env vars
-    zephyr_env = populate_zephyr_env_vars({})
-
-    if int(ARGUMENTS.get("PIOVERBOSE", 0)):
-        print(west_cmd)
-
-    result = exec_command(west_cmd, env=zephyr_env, cwd=PROJECT_DIR)
-    if result["returncode"] != 0:
-        sys.stderr.write(result["out"] + "\n")
-        sys.stderr.write(result["err"])
-        env.Exit(1)
-
-    if int(ARGUMENTS.get("PIOVERBOSE", 0)):
-        print(result["out"])
-        print(result["err"])
-
-
-def create_default_project_files(source_files):
-    build_flags = ""
-    if BUILD_FLAGS:
-        build_flags = " ".join(BUILD_FLAGS)
-    link_flags = ""
-    if BUILD_FLAGS:
-        link_flags = " ".join([item for item in BUILD_FLAGS if item.startswith("-Wl,")])
-
-    paths = []
-    for lb in env.GetLibBuilders():
-        if not lb.dependent:
-            continue
-        lb.env.PrependUnique(CPPPATH=lb.get_include_dirs())
-        paths.extend(lb.env["CPPPATH"])
-    DefaultEnvironment().Replace(__PIO_LIB_BUILDERS=None)
-
-    if len(paths):
-        build_flags += " " + " ".join([f'\\"-I{path}\\"' for path in paths])
-
-    cmake_tpl = f"""
-cmake_minimum_required(VERSION 3.20.0)
-
-find_package(Zephyr REQUIRED HINTS $ENV{{ZEPHYR_BASE}})
-
-project({os.path.basename(PROJECT_DIR)})
-
-SET(CMAKE_CXX_FLAGS  "${{CMAKE_CXX_FLAGS}} {build_flags}")
-SET(CMAKE_C_FLAGS  "${{CMAKE_C_FLAGS}} {build_flags}")
-zephyr_ld_options({link_flags})
-
-target_sources(app PRIVATE {" ".join(source_files)})
-target_include_directories(app PRIVATE ../src)
-"""
-
-    app_tpl = """
-#include <zephyr.h>
-
-void main(void)
-{
-}
-"""
-
-    cmake_tmp_file = os.path.join(PROJECT_DIR, "app", "CMakeLists.tmp")
-    cmake_txt_file = os.path.join(PROJECT_DIR, "app", "CMakeLists.txt")
-    if not os.path.isdir(os.path.dirname(cmake_tmp_file)):
-        os.makedirs(os.path.dirname(cmake_tmp_file))
-    with open(cmake_tmp_file, "w") as fp:
-        fp.write(cmake_tpl)
-    if not os.path.isfile(cmake_txt_file) or not filecmp.cmp(
-        cmake_tmp_file, cmake_txt_file
-    ):
-        shutil.move(cmake_tmp_file, cmake_txt_file)
-    else:
-        os.remove(cmake_tmp_file)
-
-    if not os.listdir(os.path.join(PROJECT_SRC_DIR)):
-        # create an empty file to make CMake happy during first init
-        with open(os.path.join(PROJECT_SRC_DIR, "main.c"), "w") as fp:
-            fp.write(app_tpl)
-
-
 def get_zephyr_target(board_config):
     return board_config.get("build.zephyr.variant", env.subst("$BOARD").lower())
-
-
-def correct_escape_sequences(file_path):
-    with open(file_path, "r") as file:
-        content = file.read()
-    corrected_content = content.replace(
-        "re.split('\\s+', line)", "re.split('\\\\s+', line)"
-    )
-    with open(file_path, "w") as file:
-        file.write(corrected_content)
 
 
 def obj(target, source, env):
@@ -472,14 +371,15 @@ def flash_pyocd(zephyr, *args, **kwargs):
 
 
 def setup_builder(zephyr, env):
-    FIRMWARE_ELF = Path(BUILD_DIR) / "firmware.elf"
-    if FIRMWARE_ELF.is_file():
-        FIRMWARE_ELF.unlink()
+    firmware_elf = zephyr.build_env.build_dir / "firmware.elf"
+    if firmware_elf.is_file():
+        firmware_elf.unlink()
 
     env["BUILDERS"]["Object"] = SCons.Builder.Builder(action=obj)
     env["CCCOM"] = Action(lib)
     env["ARCOM"] = Action(nop)
     env["RANLIBCOM"] = Action(nop)
+    env["ENV"] = zephyr.build_env.env
     ProgramScanner = SCons.Scanner.Prog.ProgramScanner()
     env["BUILDERS"]["Program"] = SCons.Builder.Builder(
         action=lambda target, source, env: dontGenerateProgram(
@@ -495,19 +395,56 @@ def setup_builder(zephyr, env):
         OBJCOPY="arm-zephyr-eabi-objcopy",
     )
 
-    env.AddCustomTarget("flash_pyocd", None, lambda *args, **kwargs: flash_pyocd(zephyr, *args, **kwargs))
+    env.AddCustomTarget(
+        "flash_pyocd",
+        None,
+        lambda *args, **kwargs: flash_pyocd(zephyr, *args, **kwargs),
+    )
 
 
-def main():
+def setup_env(env):
     build_env = BuildEnvironment(
-        Path(PROJECT_DIR), Path(PROJECT_SRC_DIR), Path(BUILD_DIR), Path(FRAMEWORK_DIR)
+        Path(env.subst("$PROJECT_DIR")),
+        Path(env.subst("$PROJECT_SRC_DIR")),
+        Path(env.subst("$BUILD_DIR")),
+        Path(platform.get_package_dir("framework-zephyr")),
     )
     venv_path = build_env.project_dir / ".venv"
     build_env.create_venv(venv_path)
     build_env.install_requirements(build_env.framework_dir / "requirements.txt")
+
     build_env.run_python(
-        [Path(platform.get_package_dir("toolchain-gccarmnoneeabi")) / "install.py"]
+        [
+            str(
+                Path(platform.get_package_dir("toolchain-gccarmnoneeabi"))
+                / "install.py"
+            )
+        ],
+        cwd=build_env.framework_dir,
     )
-    build_env.set_env("ZEPHYR_SDK_INSTALL_DIR", TOOLCHAIN_ROOT)
+    toolchain_version = version.get_original_version(
+        platform.get_package_version("toolchain-gccarmnoneeabi").split("+")[0]
+    )
+    toolchain_root = (
+        Path(platform.get_package_dir("toolchain-gccarmnoneeabi"))
+        / f"zephyr-sdk-0.{toolchain_version}"
+    )
+    build_env.set_env("ZEPHYR_SDK_INSTALL_DIR", str(toolchain_root))
+    build_env.set_env("PATH", str(Path(toolchain_root) / "arm-zephyr-eabi" / "bin"))
+    return build_env
+
+
+def setup_zephyr(build_env):
     zephyr = ZephyrSdk(build_env, "v4.3.0")
+    zephyr.add_modules(["cmsis_6", "hal_nordic", "mcuboot", "zcbor"])
     zephyr.install()
+    return zephyr
+
+
+def main(env):
+    build_env = setup_env(env)
+    zephyr = setup_zephyr(build_env)
+    setup_builder(zephyr, env)
+
+
+main(env)
