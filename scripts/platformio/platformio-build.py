@@ -12,17 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import sys
 import shutil
-import json
 import filecmp
 from pathlib import Path
-from platform import machine
 
-from platformio.package import version
-from platformio.compat import IS_WINDOWS
-from platformio import fs
 from platformio.proc import exec_command
 import SCons.Builder
 
@@ -65,7 +59,7 @@ def run_west_build(
     verbose=False,
 ):
     print("Running west build")
-    app_dir = project_dir / "zephyr"
+    app_dir = project_dir / "app"
     west_cmd = ["python", "-m", "west", "build"]
     if sysbuild:
         print("Building in sysbuild mode")
@@ -83,6 +77,7 @@ def run_west_build(
         f"-DPIO_PACKAGES_DIR:PATH={pio_packages_path}",
         f"-DDOTCONFIG={config_path}",
     ]
+    print(west_cmd)
 
     menuconfig_file = app_dir / "menuconfig.conf"
     if menuconfig_file.is_file():
@@ -91,7 +86,7 @@ def run_west_build(
 
     west_cmd += cmake_extra_args
 
-    #if verbose:
+    # if verbose:
     print(" ".join(map(str, west_cmd)))
 
     result = exec_command(west_cmd, env=sdk.env, cwd=sdk_dir)
@@ -149,8 +144,8 @@ void main(void)
 }
 """
 
-    cmake_tmp_file = project_dir / "zephyr" / "CMakeLists.tmp"
-    cmake_txt_file = project_dir / "zephyr" / "CMakeLists.txt"
+    cmake_tmp_file = project_dir / "app" / "CMakeLists.tmp"
+    cmake_txt_file = project_dir / "app" / "CMakeLists.txt"
     cmake_txt_file.parent.mkdir(parents=True, exist_ok=True)
     with cmake_tmp_file.open("w") as fp:
         fp.write(cmake_tpl)
@@ -220,15 +215,15 @@ def dontGenerateProgram(
             pio_packages_path=pio_packages_path,
             board=get_zephyr_target(board, env),
             cmake_extra_args=get_cmake_extra_args(board, env),
-            pristine=pristine=="True",
-            sysbuild=sysbuild=="True",
+            pristine=pristine == "True",
+            sysbuild=sysbuild == "True",
             verbose=verbose,
         )
     except Exception as e:
         print(e, file=sys.stderr)
         env.Exit(1)
-    shutil.move(
-        build_dir / "zephyr" / "zephyr" / "zephyr.elf", project_dir / str(target[0])
+    shutil.copy2(
+        build_dir / "app" / "zephyr" / "zephyr.elf", project_dir / str(target[0])
     )
 
     return None
@@ -265,7 +260,39 @@ def setup_build(sdk):
     )
 
 
-def flash_pyocd(*args, **kwargs):
+def flash_dfu(sdk, *args, **kwargs):
+    nrfutil = sdk.nrfutil
+    fw_hex = BUILD_DIR / "merged.hex"
+    if not fw_hex.is_file():
+        raise RuntimeError(f"Firmware file {fw_hex} not found")
+    fw_zip = BUILD_DIR / "merged.zip"
+    nrfutil.run_subcommand(
+        "nrf5sdk-tools",
+        [
+            "pkg",
+            "generate",
+            "--hw-version",
+            "52",
+            "--sd-req",
+            "0x00",
+            "--application",
+            str(BUILD_DIR / "merged.hex"),
+            "--application-version",
+            "1",
+            str(fw_zip),
+        ],
+    )
+    if not fw_zip.is_file():
+        raise RuntimeError(f"DFU package file {fw_zip} not found")
+    if "UPLOAD_PORT" not in kwargs["env"]:
+        raise RuntimeError("UPLOAD_PORT is not set")
+    nrfutil.run_subcommand(
+        "nrf5sdk-tools",
+        ["dfu", "usb-serial", "-pkg", str(fw_zip), "--port", kwargs["env"]["UPLOAD_PORT"]],
+    )
+
+
+def flash_pyocd(sdk, *args, **kwargs):
     flash_cmd = [
         "$PYTHONEXE",
         "-m",
@@ -285,7 +312,13 @@ try:
     sys.path.append(str(NRFUTIL_ROOT))
     sdk = install_sdk(FRAMEWORK_DIR / "nrfutil_sdk")
     setup_build(sdk)
+    env.AddCustomTarget(
+        "flash_pyocd", None, lambda *args, **kwargs: flash_pyocd(sdk, *args, **kwargs)
+    )
+    env.AddCustomTarget(
+        "flash_dfu", None, lambda *args, **kwargs: flash_dfu(sdk, *args, **kwargs)
+    )
+
 except Exception as e:
     print(e, file=sys.stderr)
     env.Exit(1)
-env.AddCustomTarget("flash_pyocd", None, flash_pyocd)
