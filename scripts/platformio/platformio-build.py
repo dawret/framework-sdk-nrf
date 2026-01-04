@@ -299,10 +299,10 @@ def flash_pyocd(build_env, *args, **kwargs):
         env.Exit(1)
 
 
-def install_sdk(install_dir: Path, version: str):
+def install_sdk(install_dir: Path, version: str, platform):
     import nrfutil
 
-    exe = nrfutil.setup(install_dir)
+    exe = nrfutil.setup(platform, install_dir)
     return exe.install_sdk(version)
 
 
@@ -319,7 +319,7 @@ try:
     framework_dir = Path(platform.get_package_dir("framework-zephyr"))
     if not framework_dir.is_dir():
         raise RuntimeError("Framework directory not found")
-    sdk = install_sdk(framework_dir / "nrfutil_sdk", f"v{sdk_version}")
+    sdk = install_sdk(framework_dir / "nrfutil_sdk", f"v{sdk_version}", platform)
     build_env = BuildEnvironment(
         project_dir=Path(env.subst("$PROJECT_DIR")),
         source_dir=Path(env.subst("$PROJECT_SRC_DIR")),
@@ -329,7 +329,9 @@ try:
     setup_build(build_env)
 
     env.AddCustomTarget(
-        "flash_pyocd", None, lambda *args, **kwargs: flash_pyocd(build_env, *args, **kwargs)
+        "flash_pyocd",
+        None,
+        lambda *args, **kwargs: flash_pyocd(build_env, *args, **kwargs),
     )
     env.AddCustomTarget(
         "flash_dfu", None, lambda *args, **kwargs: flash_dfu(build_env, *args, **kwargs)
