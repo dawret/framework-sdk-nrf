@@ -18,148 +18,153 @@ import filecmp
 from pathlib import Path
 
 from platformio.proc import exec_command
+from platformio.package import version
 import SCons.Builder
 
 Import("env")
 
-platform = env.PioPlatform()
-board = env.BoardConfig()
 
-FRAMEWORK_VERSION = platform.get_package_version("framework-zephyr").split("+")[0]
-NRFUTIL_ROOT = Path(platform.get_package_dir("nordic-nrfutil"))
+class BuildEnvironment:
+    def __init__(self, project_dir: Path, source_dir: Path, build_dir: Path, sdk):
+        self.project_dir = project_dir
+        self.source_dir = source_dir
+        self.build_dir = build_dir
+        self.app_dir = project_dir / "app"
+        self.sdk = sdk
+        self.reconfigure_required = False
 
-PROJECT_DIR = Path(env.subst("$PROJECT_DIR"))
-PROJECT_SRC_DIR = Path(env.subst("$PROJECT_SRC_DIR"))
-BUILD_DIR = Path(env.subst("$BUILD_DIR"))
-BUILD_FLAGS = env.get("BUILD_FLAGS")
-BUILD_TYPE = env.subst("$BUILD_TYPE")
+    def run(self, cmd: list[str], cwd=None):
+        if not cwd:
+            cwd = self.sdk.sdk_path
+        ret = exec_command(cmd, env=self.sdk.env, cwd=cwd)
+        if ret["returncode"] != 0:
+            raise RuntimeError(
+                f"Command {' '.join(cmd)} failed:\n{ret['out']}\n{ret['err']}"
+            )
+        return (ret["out"], ret["err"])
 
-FRAMEWORK_DIR = Path(platform.get_package_dir("framework-zephyr"))
-assert FRAMEWORK_DIR.is_dir()
+    def _is_reconfigure_required(self):
+        if self.sdk.fresh_install or self.reconfigure_required:
+            return True
+        cmake_cache_file = self.build_dir / "CMakeCache.txt"
+        if not cmake_cache_file.is_file():
+            return True
+        build_ninja_file = self.build_dir / "build.ninja"
+        if not build_ninja_file.is_file():
+            return True
+        pm_static_file = self.project_dir / "app" / "pm_static.yml"
+        if (
+            pm_static_file.is_file()
+            and pm_static_file.stat().st_mtime > cmake_cache_file.stat().st_mtime
+        ):
+            # Reconfigure if pm_static.yml has changed
+            return True
+        return False
 
-
-def install_sdk(install_dir):
-    import nrfutil
-
-    exe = nrfutil.setup(install_dir)
-    return exe.install_sdk("v3.2.0")
-
-
-def run_west_build(
-    sdk,
-    project_dir: Path,
-    build_dir: Path,
-    sdk_dir: Path,
-    config_path: Path,
-    pio_packages_path: Path,
-    board,
-    cmake_extra_args=[],
-    pristine=False,
-    sysbuild=False,
-    verbose=False,
-):
-    print("Running west build")
-    app_dir = project_dir / "app"
-    west_cmd = ["python", "-m", "west", "build"]
-    if sysbuild:
-        print("Building in sysbuild mode")
-        west_cmd += ["--sysbuild"]
-    if pristine:
-        print("Pristine build: cleaning build directory")
-        west_cmd += ["--pristine"]
-    west_cmd += [
-        "-d",
-        build_dir,
-        "-b",
-        board,
-        app_dir,
-        "--",
-        f"-DPIO_PACKAGES_DIR:PATH={pio_packages_path}",
-        f"-DDOTCONFIG={config_path}",
-    ]
-    print(west_cmd)
-
-    menuconfig_file = app_dir / "menuconfig.conf"
-    if menuconfig_file.is_file():
-        print(f"Adding -DOVERLAY_CONFIG:FILEPATH={menuconfig_file}")
-        west_cmd += [f"-DOVERLAY_CONFIG:FILEPATH={menuconfig_file}"]
-
-    west_cmd += cmake_extra_args
-
-    # if verbose:
-    print(" ".join(map(str, west_cmd)))
-
-    result = exec_command(west_cmd, env=sdk.env, cwd=sdk_dir)
-    if result["returncode"] != 0:
-        raise RuntimeError(f"West build failed:\n{result['out']}\n{result['err']}")
-
-    if verbose:
-        print(result["out"])
-        print(result["err"])
-
-
-def create_default_project_files(
-    source_files, project_dir: Path, project_source_dir: Path
-):
-    build_flags = ""
-    if BUILD_FLAGS:
-        build_flags = " ".join(BUILD_FLAGS)
-    link_flags = ""
-    if BUILD_FLAGS:
-        link_flags = " ".join([item for item in BUILD_FLAGS if item.startswith("-Wl,")])
-
-    paths = []
-    for lb in env.GetLibBuilders():
-        if not lb.dependent:
-            continue
-        lb.env.PrependUnique(CPPPATH=lb.get_include_dirs())
-        paths.extend(lb.env["CPPPATH"])
-    DefaultEnvironment().Replace(__PIO_LIB_BUILDERS=None)
-
-    if len(paths):
-        build_flags += " " + " ".join([f'\\"-I{path}\\"' for path in paths])
-
-    cmake_tpl = f"""
+    def _generate_project_files(
+        self, build_flags: list[str], link_flags: list[str], source_files: list[str]
+    ):
+        self.app_dir.mkdir(parents=True, exist_ok=True)
+        cmake_file = self.app_dir / "CMakeLists.txt"
+        cmake_tpl = f"""
 cmake_minimum_required(VERSION 3.20.0)
 
 set(Zephyr_DIR "$ENV{{ZEPHYR_BASE}}/share/zephyr-package/cmake/")
 
 find_package(Zephyr)
 
-project({project_dir.name})
+project({self.project_dir.name})
 
-SET(CMAKE_CXX_FLAGS  "${{CMAKE_CXX_FLAGS}} {build_flags}")
-SET(CMAKE_C_FLAGS  "${{CMAKE_C_FLAGS}} {build_flags}")
-zephyr_ld_options({link_flags})
+SET(CMAKE_CXX_FLAGS  "${{CMAKE_CXX_FLAGS}} {' '.join(build_flags)}")
+SET(CMAKE_C_FLAGS  "${{CMAKE_C_FLAGS}} {' '.join(build_flags)}")
+zephyr_ld_options({' '.join(link_flags)})
 
 target_sources(app PRIVATE {" ".join(source_files)})
 target_include_directories(app PRIVATE ../src)
 """
 
-    app_tpl = """
+        app_tpl = """
 #include <zephyr.h>
 
 void main(void)
 {
 }
 """
+        if not cmake_file.is_file() or cmake_file.read_text() != cmake_tpl:
+            cmake_file.write_text(cmake_tpl)
+            self.reconfigure_required = True
+        if not any(self.source_dir.iterdir()):
+            main_c_file = self.source_dir / "main.c"
+            main_c_file.parent.mkdir(parents=True, exist_ok=True)
+            main_c_file.write_text(app_tpl)
+            self.reconfigure_required = True
 
-    cmake_tmp_file = project_dir / "app" / "CMakeLists.tmp"
-    cmake_txt_file = project_dir / "app" / "CMakeLists.txt"
-    cmake_txt_file.parent.mkdir(parents=True, exist_ok=True)
-    with cmake_tmp_file.open("w") as fp:
-        fp.write(cmake_tpl)
-    if not cmake_txt_file.is_file() or not filecmp.cmp(cmake_tmp_file, cmake_txt_file):
-        shutil.move(cmake_tmp_file, cmake_txt_file)
-    else:
-        shutil.rmtree(cmake_tmp_file, ignore_errors=True)
+    def _set_extra_cmake_args(self, cmake_extra_args: list[str]):
+        try:
+            old_args, _ = self.run(["west", "config", "build.cmake-args"])
+            old_args = old_args.strip().split()
+            if sorted(old_args) == sorted(cmake_extra_args):
+                return
+        except Exception:
+            pass
 
-    main_c_file = project_source_dir / "main.c"
-    main_c_file.parent.mkdir(parents=True, exist_ok=True)
-    if not any(main_c_file.parent.iterdir()):
-        # create an empty file to make CMake happy during first init
-        with open(main_c_file, "w") as fp:
-            fp.write(app_tpl)
+        print("Setting extra CMake args:", cmake_extra_args)
+        self.run(
+            [
+                "west",
+                "config",
+                "build.cmake-args",
+                "--",
+                " ".join(cmake_extra_args),
+            ]
+        )
+        self.reconfigure_required = True
+
+    def build(
+        self,
+        board: str,
+        build_flags: list[str],
+        link_flags: list[str],
+        source_files: list[str],
+        package_dir: Path,
+        config_path: Path,
+        cmake_extra_args: list[str] = [],
+        sysbuild: bool = True,
+        pristine: bool = False,
+        verbose: bool = False,
+    ):
+        self._generate_project_files(build_flags, link_flags, source_files)
+
+        menuconfig_file = self.app_dir / "menuconfig.conf"
+        if menuconfig_file.is_file():
+            cmake_extra_args = [
+                f"-DOVERLAY_CONFIG:FILEPATH={menuconfig_file}"
+            ] + cmake_extra_args
+        cmake_extra_args = [
+            f"-DPIO_PACKAGES_DIR:PATH={package_dir}",
+            f"-DDOTCONFIG={config_path}",
+        ] + cmake_extra_args
+        self._set_extra_cmake_args(cmake_extra_args)
+
+        west_cmd = [
+            "west",
+            "build",
+            "--sysbuild" if sysbuild else "--no-sysbuild",
+            "--pristine" if self._is_reconfigure_required() else "--pristine=auto",
+            "-b",
+            board,
+            "-d",
+            str(self.build_dir),
+            str(self.app_dir),
+        ]
+        print("Building nRF Connect SDK application...")
+        if verbose:
+            print(" ".join(map(str, west_cmd)))
+
+        out, err = self.run(west_cmd)
+        if verbose:
+            print(out)
+            print(err)
 
 
 def get_zephyr_target(board_config, env):
@@ -186,44 +191,53 @@ def lib(target, source, env):
     return None
 
 
-# builder used to override the usual executable binary construction
-def dontGenerateProgram(
-    sdk, project_dir, project_source_dir, build_dir, target, source, env
-):
+def c_flags_from_env(env):
+    return [x for x in env.get("BUILD_FLAGS", [])]
+
+
+def link_flags_from_env(env):
+    return [x for x in env.get("BUILD_FLAGS", []) if x.startswith("-Wl,")]
+
+
+def get_source_files(env):
     files = env.get("PIOBUILDFILES_FINAL")
     if env.get("PIOBUILDLIBS_FINAL"):
         files.extend(env.get("PIOBUILDLIBS_FINAL"))
     files.sort()
-    try:
-        create_default_project_files(files, project_dir, project_source_dir)
-        pristine = env.GetProjectOption("pristine", "False")
-        sysbuild = env.GetProjectOption("sysbuild", "False")
-        verbose = int(ARGUMENTS.get("PIOVERBOSE", 0))
-        config_path = Path(
-            board.get(
-                "build.zephyr.config_path",
-                project_dir / f"config.{env.subst('$PIOENV')}",
-            )
+    return files
+
+
+# builder used to override the usual executable binary construction
+def dontGenerateProgram(build_env: BuildEnvironment, target, source, env):
+    pristine = env.GetProjectOption("pristine", "False")
+    sysbuild = env.GetProjectOption("sysbuild", "True")
+    board = env.BoardConfig()
+    config_path = Path(
+        board.get(
+            "build.zephyr.config_path",
+            build_env.project_dir / f"config.{env.subst("$PIOENV")}",
         )
-        pio_packages_path = Path(env.subst("$PROJECT_PACKAGES_DIR"))
-        run_west_build(
-            sdk,
-            project_dir,
-            build_dir,
-            sdk.sdk_path,
-            config_path=config_path,
-            pio_packages_path=pio_packages_path,
+    )
+
+    try:
+        build_env.build(
             board=get_zephyr_target(board, env),
+            build_flags=c_flags_from_env(env),
+            link_flags=link_flags_from_env(env),
+            source_files=get_source_files(env),
+            package_dir=Path(env.subst("$PROJECT_PACKAGES_DIR")),
+            config_path=config_path,
             cmake_extra_args=get_cmake_extra_args(board, env),
-            pristine=pristine == "True",
             sysbuild=sysbuild == "True",
-            verbose=verbose,
+            pristine=pristine == "True",
+            verbose=int(ARGUMENTS.get("PIOVERBOSE", 0)) > 0,
         )
     except Exception as e:
         print(e, file=sys.stderr)
         env.Exit(1)
     shutil.copy2(
-        build_dir / "app" / "zephyr" / "zephyr.elf", project_dir / str(target[0])
+        build_env.build_dir / "app" / "zephyr" / "zephyr.elf",
+        build_env.project_dir / str(target[0]),
     )
 
     return None
@@ -233,9 +247,8 @@ def nop(target, source, env):
     return None
 
 
-def setup_build(sdk):
-    # print("\n".join(list(f"{k}: {v}" for k, v in env.items())))
-    firmware_elf = BUILD_DIR / "firmware.elf"
+def setup_build(build_env):
+    firmware_elf = build_env.build_dir / "firmware.elf"
     if firmware_elf.exists():
         firmware_elf.unlink()
 
@@ -243,11 +256,11 @@ def setup_build(sdk):
     env["CCCOM"] = Action(lib)
     env["ARCOM"] = Action(nop)
     env["RANLIBCOM"] = Action(nop)
-    env["ENV"] = sdk.env.copy()
+    env["ENV"] = build_env.sdk.env.copy()
     ProgramScanner = SCons.Scanner.Prog.ProgramScanner()
     env["BUILDERS"]["Program"] = SCons.Builder.Builder(
         action=lambda target, source, env: dontGenerateProgram(
-            sdk, PROJECT_DIR, PROJECT_SRC_DIR, BUILD_DIR, target, source, env
+            build_env, target, source, env
         ),
         target_scanner=ProgramScanner,
     )
@@ -260,63 +273,66 @@ def setup_build(sdk):
     )
 
 
-def flash_dfu(sdk, *args, **kwargs):
-    nrfutil = sdk.nrfutil
-    fw_hex = BUILD_DIR / "merged.hex"
+def flash_dfu(build_env, *args, **kwargs):
+    nrfutil = build_env.sdk.nrfutil
+    fw_hex = build_env.build_dir / "merged.hex"
     if not fw_hex.is_file():
         raise RuntimeError(f"Firmware file {fw_hex} not found")
-    fw_zip = BUILD_DIR / "merged.zip"
-    nrfutil.run_subcommand(
-        "nrf5sdk-tools",
-        [
-            "pkg",
-            "generate",
-            "--hw-version",
-            "52",
-            "--sd-req",
-            "0x00",
-            "--application",
-            str(BUILD_DIR / "merged.hex"),
-            "--application-version",
-            "1",
-            str(fw_zip),
-        ],
-    )
+    fw_zip = build_env.build_dir / "merged.zip"
+    nrfutil.create_dfu_package(fw_hex, fw_zip)
     if not fw_zip.is_file():
         raise RuntimeError(f"DFU package file {fw_zip} not found")
     if "UPLOAD_PORT" not in kwargs["env"]:
         raise RuntimeError("UPLOAD_PORT is not set")
-    nrfutil.run_subcommand(
-        "nrf5sdk-tools",
-        ["dfu", "usb-serial", "-pkg", str(fw_zip), "--port", kwargs["env"]["UPLOAD_PORT"]],
+    nrfutil.flash_dfu_package(
+        str(kwargs["env"]["UPLOAD_PORT"]),
+        str(kwargs["env"].get("UPLOAD_SPEED", "115200")),
+        fw_zip,
     )
 
 
-def flash_pyocd(sdk, *args, **kwargs):
-    flash_cmd = [
-        "$PYTHONEXE",
-        "-m",
-        "west",
-        "flash",
-        "-d",
-        BUILD_DIR,
-        "-r",
-        "pyocd",
-    ]
-    if env.Execute(" ".join(flash_cmd)):
+def flash_pyocd(build_env, *args, **kwargs):
+    try:
+        build_env.run(["west", "flash", "-d", str(build_env.build_dir), "-r", "pyocd"])
+    except Exception as e:
+        print(e, file=sys.stderr)
         env.Exit(1)
+
+
+def install_sdk(install_dir: Path, version: str):
+    import nrfutil
+
+    exe = nrfutil.setup(install_dir)
+    return exe.install_sdk(version)
 
 
 try:
     print("Running nrfutil SDK setup...")
-    sys.path.append(str(NRFUTIL_ROOT))
-    sdk = install_sdk(FRAMEWORK_DIR / "nrfutil_sdk")
-    setup_build(sdk)
+    platform = env.PioPlatform()
+    sdk_version = version.get_original_version(
+        platform.get_package_version("framework-zephyr").split("+")[0]
+    )
+    nrfutil_root = Path(platform.get_package_dir("tool-nordic-nrfutil"))
+    if not nrfutil_root.is_dir():
+        raise RuntimeError("nrfutil directory not found")
+    sys.path.append(str(nrfutil_root))
+    framework_dir = Path(platform.get_package_dir("framework-zephyr"))
+    if not framework_dir.is_dir():
+        raise RuntimeError("Framework directory not found")
+    sdk = install_sdk(framework_dir / "nrfutil_sdk", f"v{sdk_version}")
+    build_env = BuildEnvironment(
+        project_dir=Path(env.subst("$PROJECT_DIR")),
+        source_dir=Path(env.subst("$PROJECT_SRC_DIR")),
+        build_dir=Path(env.subst("$BUILD_DIR")),
+        sdk=sdk,
+    )
+    setup_build(build_env)
+
     env.AddCustomTarget(
-        "flash_pyocd", None, lambda *args, **kwargs: flash_pyocd(sdk, *args, **kwargs)
+        "flash_pyocd", None, lambda *args, **kwargs: flash_pyocd(build_env, *args, **kwargs)
     )
     env.AddCustomTarget(
-        "flash_dfu", None, lambda *args, **kwargs: flash_dfu(sdk, *args, **kwargs)
+        "flash_dfu", None, lambda *args, **kwargs: flash_dfu(build_env, *args, **kwargs)
     )
 
 except Exception as e:
